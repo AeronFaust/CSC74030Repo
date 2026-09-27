@@ -1,21 +1,28 @@
 # __define-ocg__
-# Logarithmic Image Processing (LIP) - add, subtract, multiply, divide
+# Logarithmic Image Processing: LIP (Jourlin & Pinoli, 1988) and
+# Parameterized LIP (Panetta, Wharton & Agaian, 2008)
 # Usage:
 #   python lip_simple.py frames/            -> pairs consecutive frames (1&2, 2&3, ...)
 #   python lip_simple.py gt/ recon/         -> pairs files with the same name
 
 import sys
 import os
-import csv
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 
-M = 256.0  # LIP upper bound (8-bit images)
+M = 256.0     # LIP upper bound (8-bit images)
+C = 0.5       # scalar for c ⊗ a (c < 1 brightens, c > 1 darkens)
+
+# PLIP parameters: functions of M replace M; beta controls phi
+GAMMA = 1026.0   # gamma(M), used by addition and scalar multiplication
+K     = 1026.0   # k(M), used by subtraction
+LAM   = 1026.0   # lambda(M), used by phi
+BETA  = 2.0      # beta = 1 and GAMMA = K = LAM = M gives back LIP
 
 
-# ---------- 1. Convert between intensity and LIP gray tone ----------
-# LIP works on "gray tones": 0 = white, M = black (like light absorbed)
+# ---------- 1. Convert between intensity and gray tone ----------
+# gray tone g(i,j) = M - I(i,j): 0 = white, M = black
 def to_tone(img):
     return M - img.astype(np.float64)
 
@@ -23,50 +30,89 @@ def to_image(tone):
     return np.clip(M - tone, 0, 255).astype(np.uint8)
 
 
-# ---------- 2. Isomorphism: maps LIP space <-> real numbers ----------
-# Lets us do multiply/divide as normal math, then map back
-def phi(f):
-    return -M * np.log(np.clip(1 - f / M, 1e-6, None))
+# ---------- 2. LIP operations ----------
+def phi(a):
+    # phi(a) = -M ln(1 - a/M)
+    return -M * np.log(np.clip(1 - a / M, 1e-6, None))
 
 def phi_inv(x):
+    # phi_inv(a) = M (1 - exp(-a/M))
     return M * (1 - np.exp(-x / M))
 
-UNIT = phi(M / 2)  # mid-gray acts as "1" for multiply/divide
+def lip_add(a, b):
+    # a ⊕ b = a + b - ab/M  (never exceeds M)
+    return a + b - a * b / M
+
+def lip_sub(a, b):
+    # a ⊖ b = M(a - b)/(M - b)  (difference scaled by brightness of b)
+    return M * (a - b) / np.clip(M - b, 1e-6, None)
+
+def lip_scalar(c, a):
+    # c ⊗ a = M - M(1 - a/M)^c
+    return M - M * (1 - a / M) ** c
+
+def lip_mul(a, b):
+    # a ⊗ b = phi_inv(phi(a) * phi(b))
+    return phi_inv(phi(a) * phi(b))
+
+def lip_div(a, b):
+    # a ⊘ b = phi_inv(phi(a) / phi(b))
+    return phi_inv(phi(a) / np.clip(phi(b), 1e-6, None))
 
 
-# ---------- 3. The four LIP operations ----------
-def lip_add(f, g):
-    # never exceeds M, so no saturation
-    return f + g - f * g / M
+# ---------- 3. PLIP operations ----------
+def pphi(a):
+    # phi(a) = -lambda(M) ln^beta(1 - a/lambda(M))
+    return LAM * np.abs(np.log(np.clip(1 - a / LAM, 1e-6, None))) ** BETA
 
-def lip_sub(f, g):
-    # difference scaled by brightness of g (matches human vision)
-    return M * (f - g) / np.clip(M - g, 1e-6, None)
+def pphi_inv(x):
+    # phi_inv(a) = lambda(M) [1 - exp(-(a/lambda(M))^(1/beta))]
+    return LAM * (1 - np.exp(-(np.abs(x) / LAM) ** (1 / BETA)))
 
-def lip_mul(f, g):
-    return phi_inv(phi(f) * phi(g) / UNIT)
+def plip_add(a, b):
+    # a ⊕ b = a + b - ab/gamma(M)
+    return a + b - a * b / GAMMA
 
-def lip_div(f, g):
-    return phi_inv(UNIT * phi(f) / np.clip(phi(g), 1e-6, None))
+def plip_sub(a, b):
+    # a ⊖ b = k(M)(a - b)/(k(M) - b)
+    return K * (a - b) / np.clip(K - b, 1e-6, None)
+
+def plip_scalar(c, a):
+    # c ⊗ a = gamma(M) - gamma(M)(1 - a/gamma(M))^c
+    return GAMMA - GAMMA * (1 - a / GAMMA) ** c
+
+def plip_mul(a, b):
+    # a ⊗ b = phi_inv(phi(a) * phi(b))
+    return pphi_inv(pphi(a) * pphi(b))
+
+def plip_div(a, b):
+    # a ⊘ b = phi_inv(phi(a) / phi(b))
+    return pphi_inv(pphi(a) / np.clip(pphi(b), 1e-6, None))
 
 
 # ---------- 4. Classical (regular) arithmetic for comparison ----------
-def cls_add(a, b): return np.clip(a.astype(float) + b, 0, 255).astype(np.uint8)
-def cls_sub(a, b): return np.abs(a.astype(float) - b).astype(np.uint8)  # difference map
-def cls_mul(a, b): return np.clip(a.astype(float) * b / 255, 0, 255).astype(np.uint8)
-def cls_div(a, b): return np.clip(255 * a.astype(float) / np.clip(b.astype(float), 1, None), 0, 255).astype(np.uint8)
+def cls_add(a, b):    return np.clip(a.astype(float) + b, 0, 255).astype(np.uint8)
+def cls_sub(a, b):    return np.abs(a.astype(float) - b).astype(np.uint8)  # difference map
+def cls_scalar(c, a): return np.clip(a.astype(float) / c, 0, 255).astype(np.uint8)  # same direction as c ⊗ a
+def cls_mul(a, b):    return np.clip(a.astype(float) * b / 255, 0, 255).astype(np.uint8)
+def cls_div(a, b):    return np.clip(255 * a.astype(float) / np.clip(b.astype(float), 1, None), 0, 255).astype(np.uint8)
 
 
-# ---------- 5. Simple quality measures ----------
-def entropy(img):
-    # how much information/detail the image holds (higher = more)
-    p = np.bincount(img.ravel(), minlength=256) / img.size
-    p = p[p > 0]
-    return -(p * np.log2(p)).sum()
-
-def saturated(img):
-    # % of pixels stuck at pure black or white (lost detail)
-    return 100 * np.mean((img == 0) | (img == 255))
+# ---------- 5. Check PLIP algebraic properties on random gray tones ----------
+def check_properties():
+    rng = np.random.default_rng(0)
+    f, g, h = rng.uniform(0, 250, (3, 1000))
+    c, d = 0.7, 1.8
+    checks = {
+        "Commutativity   f ⊕ g = g ⊕ f":            (plip_add(f, g), plip_add(g, f)),
+        "Associativity   (f ⊕ g) ⊕ h = f ⊕ (g ⊕ h)": (plip_add(plip_add(f, g), h), plip_add(f, plip_add(g, h))),
+        "Unit element    f ⊕ 0 = f":                (plip_add(f, 0), f),
+        "Distributivity  (c+d) ⊗ f = c⊗f ⊕ d⊗f":     (plip_scalar(c + d, f), plip_add(plip_scalar(c, f), plip_scalar(d, f))),
+        "Commutativity   f ⊗ g = g ⊗ f":            (plip_mul(f, g), plip_mul(g, f)),
+    }
+    print("PLIP property checks:")
+    for name, (lhs, rhs) in checks.items():
+        print(f"  {name:45s} {'holds' if np.allclose(lhs, rhs) else 'FAILS'}")
 
 
 # ---------- 6. Process one pair of images ----------
@@ -74,34 +120,32 @@ def process_pair(a, b, name, out_dir):
     b = cv2.resize(b, (a.shape[1], a.shape[0]))  # match sizes
     fa, fb = to_tone(a), to_tone(b)
 
-    # apply every operation (classical vs LIP)
+    # rows = operations, columns = Classical | LIP | PLIP
     results = {
-        "Classical add": cls_add(a, b),
-        "LIP add":       to_image(lip_add(fa, fb)),
-        "Classical sub": cls_sub(a, b),
-        "LIP sub":       np.clip(np.abs(lip_sub(fa, fb)), 0, 255).astype(np.uint8),  # difference map
-        "Classical mul": cls_mul(a, b),
-        "LIP mul":       to_image(lip_mul(fa, fb)),
-        "Classical div": cls_div(a, b),
-        "LIP div":       to_image(lip_div(fa, fb)),
+        "add": (cls_add(a, b), to_image(lip_add(fa, fb)), to_image(plip_add(fa, fb))),
+        "sub": (cls_sub(a, b),                                        # difference maps
+                np.clip(np.abs(lip_sub(fa, fb)), 0, 255).astype(np.uint8),
+                np.clip(np.abs(plip_sub(fa, fb)), 0, 255).astype(np.uint8)),
+        "scalar": (cls_scalar(C, a), to_image(lip_scalar(C, fa)), to_image(plip_scalar(C, fa))),
+        "mul": (cls_mul(a, b), to_image(lip_mul(fa, fb)), to_image(plip_mul(fa, fb))),
+        "div": (cls_div(a, b), to_image(lip_div(fa, fb)), to_image(plip_div(fa, fb))),
     }
+    models = ["Classical", "LIP", "PLIP"]
 
-    # save comparison grid for this pair
-    panels = {"Input A": a, "Input B": b, **results}
-    fig, axes = plt.subplots(2, 5, figsize=(18, 7))
-    for ax, (title, img) in zip(axes.ravel(), panels.items()):
+    # save a 6 x 3 grid: inputs on top, one row per operation
+    fig, axes = plt.subplots(6, 3, figsize=(10, 19))
+    for ax in axes.ravel():
+        ax.axis("off")
+    for ax, (title, img) in zip(axes[0], [("Input A", a), ("Input B", b)]):
         ax.imshow(img, cmap="gray", vmin=0, vmax=255)
         ax.set_title(title)
-        ax.axis("off")
+    for r, (op, imgs) in enumerate(results.items(), start=1):
+        for col, img in enumerate(imgs):
+            axes[r, col].imshow(img, cmap="gray", vmin=0, vmax=255)
+            axes[r, col].set_title(f"{models[col]} {op}")
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"{name}.png"), dpi=100)
+    plt.savefig(os.path.join(out_dir, f"{name}.png"), dpi=90)
     plt.close(fig)
-
-    # return metrics for this pair
-    return [{"pair": name, "operation": op,
-             "entropy": round(entropy(img), 3),
-             "saturated_pct": round(saturated(img), 2)}
-            for op, img in results.items()]
 
 
 # ---------- 7. Build list of image pairs from folder(s) ----------
@@ -110,41 +154,30 @@ EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 def list_images(folder):
     return sorted(f for f in os.listdir(folder) if f.lower().endswith(EXTS))
 
-if len(sys.argv) == 2:
-    # one folder: consecutive frames
-    folder = sys.argv[1]
-    files = list_images(folder)
-    pairs = [(os.path.join(folder, files[i]), os.path.join(folder, files[i + 1]))
-             for i in range(len(files) - 1)]
-else:
+def build_pairs(args):
+    if len(args) == 1:
+        # one folder: consecutive frames
+        folder = args[0]
+        files = list_images(folder)
+        return [(os.path.join(folder, files[i]), os.path.join(folder, files[i + 1]))
+                for i in range(len(files) - 1)]
     # two folders: same filename in each
-    fa_dir, fb_dir = sys.argv[1], sys.argv[2]
-    common = sorted(set(list_images(fa_dir)) & set(list_images(fb_dir)))
-    pairs = [(os.path.join(fa_dir, f), os.path.join(fb_dir, f)) for f in common]
-
-print(f"Found {len(pairs)} image pairs")
+    common = sorted(set(list_images(args[0])) & set(list_images(args[1])))
+    return [(os.path.join(args[0], f), os.path.join(args[1], f)) for f in common]
 
 
-# ---------- 8. Run every pair, save figures + metrics ----------
-out_dir = "lip_results"
-os.makedirs(out_dir, exist_ok=True)
-rows = []
-for pa, pb in pairs:
-    a = cv2.imread(pa, cv2.IMREAD_GRAYSCALE)
-    b = cv2.imread(pb, cv2.IMREAD_GRAYSCALE)
-    name = os.path.splitext(os.path.basename(pa))[0]
-    rows += process_pair(a, b, name, out_dir)
-    print("done:", name)
+# ---------- 8. Run: property checks, then every pair ----------
+if __name__ == "__main__":
+    check_properties()
 
-with open(os.path.join(out_dir, "metrics.csv"), "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=["pair", "operation", "entropy", "saturated_pct"])
-    writer.writeheader()
-    writer.writerows(rows)
+    pairs = build_pairs(sys.argv[1:])
+    print(f"\nFound {len(pairs)} image pairs")
+    out_dir = "lip_results"
+    os.makedirs(out_dir, exist_ok=True)
 
-
-# ---------- 9. Print average metrics per operation ----------
-print(f"\n{'Operation':15s} {'Avg entropy':>12s} {'Avg saturated %':>16s}")
-for op in dict.fromkeys(r["operation"] for r in rows):
-    sel = [r for r in rows if r["operation"] == op]
-    print(f"{op:15s} {np.mean([r['entropy'] for r in sel]):12.2f} "
-          f"{np.mean([r['saturated_pct'] for r in sel]):16.1f}")
+    for pa, pb in pairs:
+        a = cv2.imread(pa, cv2.IMREAD_GRAYSCALE)
+        b = cv2.imread(pb, cv2.IMREAD_GRAYSCALE)
+        name = os.path.splitext(os.path.basename(pa))[0]
+        process_pair(a, b, name, out_dir)
+        print("done:", name)
